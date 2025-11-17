@@ -46,7 +46,7 @@ def session_scope() -> Iterator[Session]:
 def get_or_create_user(session: Session, user_id: int) -> User:
     user = session.get(User, user_id)
     if user is None:
-        user = User(id=user_id)
+        user = User(id=user_id, cards=50)
         session.add(user)
         session.flush()
     return user
