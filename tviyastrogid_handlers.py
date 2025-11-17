@@ -1,30 +1,91 @@
 import asyncio
+import logging
 import random
-import sqlite3
-from datetime import date
+import re
 from collections import Counter
+from datetime import date
 
-from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.state import State, StatesGroup
+from aiogram import Bot, F, Router
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+)
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.filters.state import StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, Message
 from aiogram.utils.markdown import hbold
+from openai import AsyncOpenAI
+from sqlalchemy import select
 
+from database import User, get_or_create_user, session_scope
 from tviyastrogid_keyboard import (
-    main_keyboard, zodiac_keyboard, taro_question1,
-    music_q1_kb, music_q2_kb, music_q3_kb, music_q4_kb, music_q5_kb, music_q6_kb, music_q7_kb,
-    music_q8_kb, music_q9_kb, music_q10_kb, music_q11_kb, music_q12_kb, music_q13_kb,
-    music_q14_kb, music_q15_kb,
-    architips_q1_kb, architips_q2_kb, architips_q3_kb, architips_q4_kb, architips_q5_kb,
-    architips_start_kb, architips_partner_kb, archetype_test_kb,
-    kwiz_question2_inline, explanation_cards_taro_y_or_n, daily_bonus_kb,
+    architips_partner_kb,
+    architips_q1_kb,
+    architips_q2_kb,
+    architips_q3_kb,
+    architips_q4_kb,
+    architips_q5_kb,
+    architips_start_kb,
+    archetype_test_kb,
+    daily_bonus_kb,
+    explanation_cards_taro_y_or_n,
+    kwiz_question2_inline,
+    main_keyboard,
+    music_q10_kb,
+    music_q11_kb,
+    music_q12_kb,
+    music_q13_kb,
+    music_q14_kb,
+    music_q15_kb,
+    music_q1_kb,
+    music_q2_kb,
+    music_q3_kb,
+    music_q4_kb,
+    music_q5_kb,
+    music_q6_kb,
+    music_q7_kb,
+    music_q8_kb,
+    music_q9_kb,
+    taro_question1,
+    zodiac_keyboard,
 )
-
-from openai_client import client  # AsyncOpenAI from env
+from config import OPENAI_API_KEY
 
 router = Router()
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+logger = logging.getLogger(__name__)
+
+
+async def ask_openai(prompt: str, *, temperature: float = 0.7, max_tokens: int = 600) -> str:
+    """Uniform wrapper around OpenAI calls for consistent handling."""
+    resp = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+ZODIAC_MAP = {
+    "zodiac_Овен": "Овен",
+    "zodiac_Телець": "Телець",
+    "zodiac_Близнюки": "Близнюки",
+    "zodiac_Рак": "Рак",
+    "zodiac_Лев": "Лев",
+    "zodiac_Діва": "Діва",
+    "zodiac_Терези": "Терези",
+    "zodiac_Скорпіон": "Скорпіон",
+    "zodiac_Стрілець": "Стрілець",
+    "zodiac_Козеріг": "Козеріг",
+    "zodiac_Водолій": "Водолій",
+    "zodiac_Риби": "Риби",
+}
 
 # ===== States =====
 class ProblemState(StatesGroup):
@@ -58,93 +119,67 @@ class AstroChat(StatesGroup):
     waiting_for_question = State()
 
 
-# ===== DB init + helpers =====
-def _init_db():
-    db = sqlite3.connect("tviyastrogid.db", timeout=10)
-    db.execute("PRAGMA journal_mode=WAL;")
-    db.execute("PRAGMA busy_timeout=10000;")
-    cur = db.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            zodiac_sign TEXT,
-            cards INTEGER DEFAULT 50,
-            last_gift TEXT,
-            invited_by INTEGER
-        )
-        """
-    )
-    db.commit()
-    db.close()
-
-def db_conn():
-    conn = sqlite3.connect("tviyastrogid.db", timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
-    return conn
-
-_init_db()
-
 def spend_cards_if_possible(user_id: int, amount: int) -> bool:
-    db = db_conn()
-    cur = db.cursor()
-    cur.execute("SELECT cards FROM users WHERE id = ?", (user_id,))
-    row = cur.fetchone()
-    if row and (row[0] or 0) >= amount:
-        cur.execute("UPDATE users SET cards = cards - ? WHERE id = ?", (amount, user_id))
-        db.commit()
-        db.close()
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        if not user or (user.cards or 0) < amount:
+            return False
+        user.cards = (user.cards or 0) - amount
         return True
-    db.close()
-    return False
 
 
-# ===== /start (no deep link) =====
+def extract_inviter_id(command: CommandObject | None) -> int | None:
+    """Extract inviter id from the deep link payload if it contains digits."""
+    if not command or not command.args:
+        return None
+    match = re.search(r"\d+", command.args)
+    if not match:
+        return None
+    try:
+        return int(match.group())
+    except ValueError:
+        return None
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def unified_start_handler(message: Message, command: CommandObject, state: FSMContext):
     user_id = message.from_user.id
 
-    db = db_conn()
-    cur = db.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (user_id,))
-    db.commit()
-    db.close()
+    # ===== Визначаємо інвайтера =====
+    inviter_id = extract_inviter_id(command)
+    logger.info(f"Invited By: {inviter_id}")
 
+    # Забороняємо рефералити себе
+    if inviter_id == user_id:
+        inviter_id = None
+
+    # Логіка через БД
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        is_new_user = user is None
+
+        if not user:
+            # новий юзер
+            user = User(id=user_id, cards=0, invited_by=inviter_id)
+            session.add(user)
+        else:
+            # існує, але нема інвайтера і він є в deep link
+            if inviter_id and not user.invited_by:
+                user.invited_by = inviter_id
+
+        # Інвайтеру нараховуємо тільки якщо юзер новий
+        if inviter_id and is_new_user:
+            inviter = get_or_create_user(session, inviter_id)
+            inviter.cards = (inviter.cards or 0) + 25
+
+    # ===== Привітання =====
     photo = "AgACAgIAAxkBAAIFRGgUnhBhg0pqMszswBANaZYpsCuOAAIb-jEbbpihSGn8T3t5wVOcAQADAgADeQADNgQ"
+
     await message.answer_photo(
         photo=photo,
         caption="Привіт, це твій персональний АстроГід 🌌\nЯ допоможу тобі дізнатися твою долю."
     )
-    zodiac_msg = await message.answer("Обери свій знак зодіаку!", reply_markup=zodiac_keyboard)
-    await state.update_data(zodiac_msg_id=zodiac_msg.message_id)
-    await state.set_state(regist.zodiak_callback1)
 
-
-# ===== /start with deep link (referrals) =====
-@router.message(CommandStart(deep_link=True))
-async def cmd_start_with_ref(message: Message, command: CommandObject, state: FSMContext):
-    user_id = message.from_user.id
-    inviter_id = int(command.args) if command.args and command.args.isdigit() else None
-
-    db = db_conn()
-    cur = db.cursor()
-
-    cur.execute("SELECT 1 FROM users WHERE id = ?", (user_id,))
-    exists = cur.fetchone()
-
-    if not exists:
-        cur.execute("INSERT INTO users (id, cards, invited_by) VALUES (?, ?, ?)", (user_id, 0, inviter_id))
-        if inviter_id and inviter_id != user_id:
-            cur.execute("UPDATE users SET cards = COALESCE(cards,0) + 25 WHERE id = ?", (inviter_id,))
-
-    db.commit()
-    db.close()
-
-    await message.answer_photo(
-        photo="AgACAgIAAxkBAAIFRGgUnhBhg0pqMszswBANaZYpsCuOAAIb-jEbbpihSGn8T3t5wVOcAQADAgADeQADNgQ",
-        caption="Привіт, це твій персональний АстроГід 🌌\nЯ допоможу тобі дізнатися свою долю."
-    )
     zodiac_msg = await message.answer("Обери свій знак зодіаку!", reply_markup=zodiac_keyboard)
     await state.update_data(zodiac_msg_id=zodiac_msg.message_id)
     await state.set_state(regist.zodiak_callback1)
@@ -161,24 +196,16 @@ async def zodiac_callback_handler(callback: CallbackQuery, state: FSMContext):
         except:
             pass
 
-    zodiac_map = {
-        "zodiac_Овен": "Овен", "zodiac_Телець": "Телець", "zodiac_Близнюки": "Близнюки",
-        "zodiac_Рак": "Рак", "zodiac_Лев": "Лев", "zodiac_Діва": "Діва",
-        "zodiac_Терези": "Терези", "zodiac_Скорпіон": "Скорпіон", "zodiac_Стрілець": "Стрілець",
-        "zodiac_Козеріг": "Козеріг", "zodiac_Водолій": "Водолій", "zodiac_Риби": "Риби"
-    }
-    zodiak = zodiac_map.get(callback.data)
+    zodiak = ZODIAC_MAP.get(callback.data)
     if not zodiak:
         await callback.message.answer("Щось пішло не так. Знак не знайдено.")
         await callback.answer()
         return
 
     user_id = callback.from_user.id
-    db = db_conn()
-    cur = db.cursor()
-    cur.execute("UPDATE users SET zodiac_sign = ? WHERE id = ?", (zodiak, user_id))
-    db.commit()
-    db.close()
+    with session_scope() as session:
+        user = get_or_create_user(session, user_id)
+        user.zodiac_sign = zodiak
 
     await callback.message.answer(f"🔮 Прекрасно! Ви обрали знак {zodiak}.")
     await callback.message.answer("Оберіть що вас інтересує в меню знизу", reply_markup=main_keyboard)
@@ -262,13 +289,7 @@ async def explanation_cards_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=600,
-        )
-        result = resp.choices[0].message.content.strip()
+        result = await ask_openai(prompt, temperature=0.7, max_tokens=600)
         await callback.message.answer(f"📖 Пояснення розкладу:\n\n{result}")
         await state.clear()
     except Exception as e:
@@ -333,13 +354,7 @@ async def scan_palm(message: Message, state: FSMContext):
 
     try:
         await message.bot.send_chat_action(message.chat.id, "typing")
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=600,
-        )
-        result = resp.choices[0].message.content.strip()
+        result = await ask_openai(prompt, temperature=0.7, max_tokens=600)
         await message.answer(result)
     except Exception as e:
         print(f"scan_palm error: {e}")
@@ -384,13 +399,7 @@ async def process_astro_question(message: Message, state: FSMContext):
 """
 
     try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=700,
-        )
-        answer = resp.choices[0].message.content.strip()
+        answer = await ask_openai(prompt, temperature=0.7, max_tokens=700)
         await message.answer(f"🔮 Відповідь Астрологині:\n\n{answer}")
         await state.clear()
     except Exception as e:
@@ -453,13 +462,7 @@ async def choose_partner_sign(callback: CallbackQuery, state: FSMContext):
 """
 
     try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.8,
-            max_tokens=500,
-        )
-        answer = resp.choices[0].message.content.strip()
+        answer = await ask_openai(prompt, temperature=0.8, max_tokens=500)
 
         await callback.message.answer(f"🔮 Відповідь Астрологині:\n\n{answer}")
         await callback.message.answer(
@@ -540,13 +543,7 @@ async def next_question(callback: CallbackQuery, state: FSMContext):
 Пиши українською, щиро й конкретно, без списків і води (≈ 120–160 слів).
 """
             try:
-                resp = await client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.8,
-                    max_tokens=600,
-                )
-                answer = resp.choices[0].message.content.strip()
+                answer = await ask_openai(prompt, temperature=0.8, max_tokens=600)
                 await callback.message.answer(f"🔮 Відповідь Астрологині:\n\n{answer}")
                 await state.clear()
             except Exception as e:
@@ -587,13 +584,7 @@ async def interpret_dream(message: Message, state: FSMContext):
 """
 
     try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=700,
-        )
-        answer = resp.choices[0].message.content.strip()
+        answer = await ask_openai(prompt, temperature=0.7, max_tokens=700)
         await message.answer(f"🔮 Тлумачення сну:\n{answer}")
         await state.clear()
     except Exception as e:
@@ -626,13 +617,7 @@ async def astral_habit(message: Message, state: FSMContext):
     )
 
     try:
-        resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
-            max_tokens=60,
-        )
-        answer = resp.choices[0].message.content.strip()
+        answer = await ask_openai(prompt, temperature=0.9, max_tokens=60)
         await message.answer(answer)
         await state.clear()
     except Exception as e:
@@ -648,44 +633,35 @@ async def daily_bonus_handler(callback: CallbackQuery):
 
     await callback.bot.send_chat_action(callback.message.chat.id, "typing")
 
-    db = db_conn()
+    today_str = date.today().isoformat()
+    already_claimed = False
+
     try:
-        cur = db.cursor()
-        cur.execute("SELECT cards, last_gift FROM users WHERE id = ?", (user_id,))
-        row = cur.fetchone()
-
-        if row is None:
-            cur.execute("INSERT INTO users (id, cards, last_gift) VALUES (?, ?, NULL)", (user_id, 0))
-            db.commit()
-            cards, last_gift = 0, None
-        else:
-            cards, last_gift = row[0] or 0, row[1]
-
-        today_str = date.today().isoformat()
-        if last_gift == today_str:
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except:
-                pass
-            await callback.message.answer("🔔 Ти вже забирав щоденний бонус сьогодні. Повертайся завтра! 😊")
-            await callback.answer()
-            return
-
-        new_cards = cards + amount
-        cur.execute("UPDATE users SET cards = ?, last_gift = ? WHERE id = ?", (new_cards, today_str, user_id))
-        db.commit()
-
+        with session_scope() as session:
+            user = get_or_create_user(session, user_id)
+            if user.last_gift == today_str:
+                already_claimed = True
+            else:
+                user.cards = (user.cards or 0) + amount
+                user.last_gift = today_str
     except Exception as e:
         print(f"daily_bonus_handler error: {e}")
         await callback.message.answer("⚠️ Сталася помилка під час нарахування бонусу. Спробуй пізніше.")
         await callback.answer()
         return
-    finally:
-        db.close()
+
+    if already_claimed:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer("🔔 Ти вже забирав щоденний бонус сьогодні. Повертайся завтра! 😊")
+        await callback.answer()
+        return
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except:
+    except Exception:
         pass
 
     await callback.message.answer(f"🎉 Ти отримав +{amount} 🃏. Завітай завтра ще!")
@@ -699,33 +675,98 @@ async def generate_daily_horoscope(sign: str) -> str:
 Будь теплим, мудрим і натхненним. Уникай шаблонів і повторів, пиши українською.
 Не використовуй фразу «день буде складним» — заміни її м'якою метафорою.
 """
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.8,
-        max_tokens=160,
-    )
-    return resp.choices[0].message.content.strip()
+    return await ask_openai(prompt, temperature=0.8, max_tokens=160)
 
-async def daily_broadcast(bot: Bot):
-    db = db_conn()
-    cur = db.cursor()
-    cur.execute("SELECT id, zodiac_sign FROM users WHERE zodiac_sign IS NOT NULL")
-    users = cur.fetchall()
-    db.close()
+HOROSCOPE_MAX_RETRIES = 3
+BROADCAST_MAX_RETRIES = 3
+BROADCAST_DELAY_SECONDS = 0.08
 
-    for user_id, sign in users:
+
+async def _generate_horoscope_with_retry(sign: str) -> str:
+    """Generate horoscope text with retry logic to shield against transient errors."""
+    delay = 1.0
+    for attempt in range(1, HOROSCOPE_MAX_RETRIES + 1):
         try:
-            text = await generate_daily_horoscope(sign)
+            return await generate_daily_horoscope(sign)
+        except Exception as exc:
+            logger.warning(
+                "Failed to generate horoscope for %s (attempt %s/%s): %s",
+                sign,
+                attempt,
+                HOROSCOPE_MAX_RETRIES,
+                exc,
+            )
+            if attempt == HOROSCOPE_MAX_RETRIES:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 15)
+    return f"Sogodni zori movchat dlya {sign}. Zajdi trochi piznishe, my poprobuemo znovu."
+
+
+async def _build_horoscope_cache(signs: set[str]) -> dict[str, str]:
+    cache: dict[str, str] = {}
+    for sign in signs:
+        cache[sign] = await _generate_horoscope_with_retry(sign)
+    return cache
+
+
+async def _send_broadcast_message(bot: Bot, user_id: int, sign: str, horoscope: str) -> None:
+    delay = BROADCAST_DELAY_SECONDS
+    for attempt in range(1, BROADCAST_MAX_RETRIES + 1):
+        try:
             await bot.send_message(
                 chat_id=user_id,
-                text=f"🌟 Гороскоп для {sign}:\n\n{text}",
+                text=f"Daily horoscope for {sign}:\n\n{horoscope}",
                 reply_markup=daily_bonus_kb,
             )
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            print(f"❌ Не надіслано {user_id}: {e}")
+            await asyncio.sleep(BROADCAST_DELAY_SECONDS)
+            return
+        except TelegramRetryAfter as exc:
+            wait_time = exc.retry_after + 1
+            logger.info("Flood wait for %s. Sleeping %.2fs", user_id, wait_time)
+            await asyncio.sleep(wait_time)
+        except (TelegramForbiddenError, TelegramNotFound):
+            logger.info("Broadcast skipped for %s: bot blocked or user not found", user_id)
+            return
+        except TelegramBadRequest as exc:
+            logger.warning("Bad request while broadcasting to %s: %s", user_id, exc)
+            return
+        except TelegramAPIError as exc:
+            logger.warning(
+                "Telegram API error for %s (attempt %s/%s): %s",
+                user_id,
+                attempt,
+                BROADCAST_MAX_RETRIES,
+                exc,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected error while sending broadcast to %s: %s", user_id, exc)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 5)
+    logger.error("Failed to deliver broadcast to %s after %s attempts", user_id, BROADCAST_MAX_RETRIES)
 
+
+async def daily_broadcast(bot: Bot):
+    with session_scope() as session:
+        users = session.execute(
+            select(User.id, User.zodiac_sign).where(User.zodiac_sign.is_not(None))
+        ).all()
+
+    if not users:
+        logger.info("No users with zodiac signs to broadcast to.")
+        return
+
+    signs = {sign for _, sign in users if sign}
+    horoscope_cache = await _build_horoscope_cache(signs) if signs else {}
+
+    for user_id, sign in users:
+        if not sign:
+            continue
+        horoscope = horoscope_cache.get(sign)
+        if not horoscope:
+            logger.warning("No horoscope text for sign %s, skipping user %s", sign, user_id)
+            continue
+        await _send_broadcast_message(bot, user_id, sign, horoscope)
 
 # ===== Invite & Cards =====
 @router.message(F.text == "🤝 Запросити друга")
@@ -740,10 +781,7 @@ async def invite_friend(message: Message):
 @router.message(F.text == "🛒Мої карти")
 async def my_cards(message: Message):
     user_id = message.from_user.id
-    db = db_conn()
-    cur = db.cursor()
-    cur.execute("SELECT cards FROM users WHERE id = ?", (user_id,))
-    row = cur.fetchone()
-    db.close()
-    cards = int(row[0]) if row and row[0] else 0
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        cards = int(user.cards) if user and user.cards else 0
     await message.answer(f"💳 Баланс: {cards} 🃏")
