@@ -22,7 +22,7 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     zodiac_sign: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    cards: Mapped[int] = mapped_column(Integer, nullable=False, default=50, server_default="50")
+    cards: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     last_gift: Mapped[Optional[str]] = mapped_column(String(32))
     invited_by: Mapped[Optional[int]] = mapped_column(Integer)
 
