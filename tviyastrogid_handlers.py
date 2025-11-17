@@ -160,7 +160,7 @@ async def unified_start_handler(message: Message, command: CommandObject, state:
 
         if not user:
             # новий юзер
-            user = User(id=user_id, cards=0, invited_by=inviter_id)
+            user = User(id=user_id, cards=50, invited_by=inviter_id)
             session.add(user)
         else:
             # існує, але нема інвайтера і він є в deep link
